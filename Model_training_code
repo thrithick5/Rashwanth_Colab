@@ -1,0 +1,558 @@
+# Workstation Rental Price Tier Prediction — Leak-Free v2 Ensemble (Google Colab)
+This notebook reproduces the **0.71705+ Unseen-Operator Macro F1** submission and exports both:
+- `workstation_price_tier_v2_model.joblib` (trained 5-fold ensemble model file)
+- `submission.csv` (114,538 test predictions ready for Kaggle)
+
+**How to use in Google Colab:**
+1. Upload either your precomputed `train_v2.pkl`, `test_v2.pkl`, and `meta_groups.pkl` (from `/Users/tharunhrithicksr/Documents/Rashwanth Kaggle/kaggle_ready_dataset/`, fastest ~3 mins) **OR** the raw `train.csv` and `test.csv` files to Colab (or mount Google Drive).
+2. Run all cells below.
+
+# Optional: Mount Google Drive if your dataset is stored in Drive
+# from google.colab import drive
+# drive.mount("/content/drive")
+
+import os
+import re
+import time
+import warnings
+import joblib
+import numpy as np
+import pandas as pd
+from scipy import sparse
+from scipy.spatial import cKDTree
+from scipy.optimize import minimize
+from sklearn.model_selection import StratifiedGroupKFold
+from sklearn.preprocessing import OneHotEncoder, OrdinalEncoder
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.decomposition import TruncatedSVD
+from sklearn.linear_model import LogisticRegression, Ridge
+from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
+from sklearn.metrics import f1_score, accuracy_score
+
+warnings.filterwarnings("ignore")
+
+# Optional LightGBM support (pre-installed in Google Colab)
+try:
+    import lightgbm as lgb
+    HAS_LGB = True
+except ImportError:
+    HAS_LGB = False
+
+def find_data_dir():
+    candidate_dirs = [
+        ".",
+        "./kaggle_ready_dataset",
+        "/content",
+        "/content/kaggle_ready_dataset",
+        "/content/drive/MyDrive/Rashwanth Kaggle",
+        "/content/drive/MyDrive/Rashwanth Kaggle/kaggle_ready_dataset",
+        "/Users/tharunhrithicksr/Documents/Rashwanth Kaggle",
+        "/Users/tharunhrithicksr/Documents/Rashwanth Kaggle/kaggle_ready_dataset",
+    ]
+    for d in candidate_dirs:
+        if os.path.exists(os.path.join(d, "train_v2.pkl")) and os.path.exists(os.path.join(d, "test_v2.pkl")):
+            return d, "pickles"
+    for d in candidate_dirs:
+        if os.path.exists(os.path.join(d, "train.csv")) and os.path.exists(os.path.join(d, "test.csv")):
+            return d, "csv"
+    return ".", "missing"
+
+def build_v2_features_from_csv(data_dir, out_dir="."):
+    t0 = time.time()
+    print(f"[1/6] Loading raw train.csv and test.csv from {data_dir}...")
+    train_raw = pd.read_csv(os.path.join(data_dir, "train.csv"))
+    test_raw = pd.read_csv(os.path.join(data_dir, "test.csv"))
+
+    n_train = len(train_raw)
+    y_zero = train_raw["price_tier"].to_numpy(dtype=np.int64) - 1
+    y_cont = train_raw["price_tier"].to_numpy(dtype=np.float32)
+    df = pd.concat([train_raw.drop(columns=["price_tier"]), test_raw], axis=0, ignore_index=True)
+
+    print("[2/6] Reconstructing true_op and physical listing_id entities...")
+    op_key_cols = [
+        c for c in [
+            "operator_ref", "metro", "operator_platform_age_years",
+            "operator_platform_age_months", "operator_portfolio_size"
+        ] if c in df.columns
+    ]
+    true_op_series = df[op_key_cols].fillna("NA").astype(str).agg("|".join, axis=1)
+    true_op_codes, _ = pd.factorize(true_op_series)
+    df["true_op_id"] = true_op_codes
+
+    lat_round = df["geo_lat"].fillna(0).round(5).astype(str) if "geo_lat" in df.columns else "0"
+    lon_round = df["geo_lon"].fillna(0).round(5).astype(str) if "geo_lon" in df.columns else "0"
+    acc_str = df["access_type"].fillna("NA").astype(str) if "access_type" in df.columns else "NA"
+    cap_str = df["seat_capacity"].fillna(-1).astype(str) if "seat_capacity" in df.columns else "-1"
+    desk_str = df["desk_count"].fillna(-1).astype(str) if "desk_count" in df.columns else "-1"
+    room_str = df["room_count"].fillna(-1).astype(str) if "room_count" in df.columns else "-1"
+
+    listing_series = (
+        true_op_series + "|" + lat_round + "|" + lon_round + "|" + acc_str + "|" + cap_str + "|" + desk_str + "|" + room_str
+    )
+    listing_codes, _ = pd.factorize(listing_series)
+    df["listing_id"] = listing_codes
+
+    sgkf = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=42)
+    folds = np.zeros(n_train, dtype=np.int64)
+    for fold, (_, val_idx) in enumerate(sgkf.split(np.zeros(n_train), y_zero, groups=true_op_codes[:n_train])):
+        folds[val_idx] = fold
+
+    print("[3/6] Engineering physical capacity, availability, review, and ratio features...")
+    feats = pd.DataFrame(index=df.index)
+    feats["space_id"] = df["space_id"].to_numpy()
+
+    for col in df.columns:
+        if df[col].dtype == object and col not in ["facilities", "operator_ref"]:
+            sample = df[col].dropna().astype(str).head(50)
+            if sample.str.endswith("%").any():
+                feats[col + "_num"] = pd.to_numeric(df[col].astype(str).str.rstrip("%"), errors="coerce")
+            elif sample.isin(["t", "f", "True", "False", "yes", "no", "Y", "N"]).all():
+                feats[col + "_bin"] = df[col].astype(str).map(
+                    {"t": 1, "True": 1, "yes": 1, "Y": 1, "f": 0, "False": 0, "no": 0, "N": 0}
+                ).fillna(-1).astype(np.float32)
+
+    num_cols = [c for c in df.select_dtypes(include=[np.number]).columns if c not in ["space_id", "true_op_id", "listing_id"]]
+    for c in num_cols:
+        feats[c] = df[c].astype(np.float32)
+
+    if "seat_capacity" in feats.columns and "desk_count" in feats.columns:
+        feats["seats_per_desk"] = feats["seat_capacity"] / (feats["desk_count"].clip(lower=0) + 1.0)
+        feats["desk_minus_seat"] = feats["desk_count"] - feats["seat_capacity"]
+    if "seat_capacity" in feats.columns and "room_count" in feats.columns:
+        feats["seats_per_room"] = feats["seat_capacity"] / (feats["room_count"].clip(lower=0) + 1.0)
+    if "desk_count" in feats.columns and "room_count" in feats.columns:
+        feats["desks_per_room"] = feats["desk_count"] / (feats["room_count"].clip(lower=0) + 1.0)
+    if "seat_capacity" in feats.columns and "setup_count" in feats.columns:
+        feats["seats_per_setup"] = feats["seat_capacity"] / (feats["setup_count"].clip(lower=0) + 1.0)
+
+    avail_cols = [c for c in feats.columns if "open_days" in c or "avail" in c]
+    if len(avail_cols) >= 2:
+        feats["avail_mean"] = feats[avail_cols].mean(axis=1)
+        feats["avail_std"] = feats[avail_cols].std(axis=1)
+    if "open_days_30" in feats.columns and "open_days_365" in feats.columns:
+        feats["open_ratio_30_365"] = (feats["open_days_30"] * 12.167) / (feats["open_days_365"].clip(lower=0) + 1.0)
+    if "open_days_60" in feats.columns and "open_days_90" in feats.columns:
+        feats["open_diff_90_60"] = feats["open_days_90"] - feats["open_days_60"]
+
+    rev_score_cols = [c for c in feats.columns if "score" in c or "rating" in c]
+    if len(rev_score_cols) >= 2:
+        feats["review_scores_mean"] = feats[rev_score_cols].mean(axis=1)
+        feats["review_scores_std"] = feats[rev_score_cols].std(axis=1)
+        feats["review_scores_min"] = feats[rev_score_cols].min(axis=1)
+        feats["review_scores_max"] = feats[rev_score_cols].max(axis=1)
+        feats["review_scores_missing_cnt"] = feats[rev_score_cols].isna().sum(axis=1).astype(np.float32)
+
+    print("[4/6] Computing 145-Facility TF-IDF, SVD, and leak-free OOF linear/logit projections...")
+    fac_raw = df["facilities"].fillna("").astype(str) if "facilities" in df.columns else pd.Series([""] * len(df))
+    fac_clean = fac_raw.apply(
+        lambda s: " ".join(
+            [re.sub(r"[^a-z0-9_]", "_", tok.strip().lower()) for tok in re.split(r"[,;|/]", s.strip("{}[] ")) if tok.strip()]
+        )
+    )
+    feats["facility_count"] = fac_clean.apply(lambda s: len(s.split()) if s else 0).astype(np.float32)
+    feats["facility_char_len"] = fac_raw.str.len().astype(np.float32)
+    if "seat_capacity" in feats.columns:
+        feats["facilities_per_seat"] = feats["facility_count"] / (feats["seat_capacity"].clip(lower=0) + 1.0)
+
+    tfidf = TfidfVectorizer(max_features=200, token_pattern=r"(?u)\b\w+\b", sublinear_tf=True)
+    X_fac = tfidf.fit_transform(fac_clean)
+
+    n_svd = min(12, max(2, X_fac.shape[1] - 1))
+    svd = TruncatedSVD(n_components=n_svd, random_state=42)
+    fac_svd = svd.fit_transform(X_fac)
+    for i in range(n_svd):
+        feats[f"fac_svd_{i}"] = fac_svd[:, i].astype(np.float32)
+
+    ctx_cols = [c for c in ["metro", "access_type", "space_class", "district"] if c in df.columns]
+    if ctx_cols:
+        ohe = OneHotEncoder(handle_unknown="ignore")
+        X_ctx = ohe.fit_transform(df[ctx_cols].fillna("MISSING").astype(str))
+        X_sparse = sparse.hstack([X_fac, X_ctx]).tocsr()
+    else:
+        X_sparse = X_fac.tocsr()
+
+    X_sp_train = X_sparse[:n_train]
+    X_sp_test = X_sparse[n_train:]
+
+    oof_ridge = np.zeros(n_train, dtype=np.float32)
+    test_ridge = np.zeros(len(test_raw), dtype=np.float32)
+    oof_logit = np.zeros((n_train, 4), dtype=np.float32)
+    test_logit = np.zeros((len(test_raw), 4), dtype=np.float32)
+
+    for fold in range(5):
+        trn_i = np.where(folds != fold)[0]
+        val_i = np.where(folds == fold)[0]
+
+        ridge = Ridge(alpha=15.0, random_state=42)
+        ridge.fit(X_sp_train[trn_i], y_cont[trn_i])
+        oof_ridge[val_i] = ridge.predict(X_sp_train[val_i])
+        test_ridge += ridge.predict(X_sp_test) / 5.0
+
+        logit = LogisticRegression(C=0.5, max_iter=300, random_state=42)
+        logit.fit(X_sp_train[trn_i], y_zero[trn_i])
+        oof_logit[val_i] = logit.predict_proba(X_sp_train[val_i])
+        test_logit += logit.predict_proba(X_sp_test) / 5.0
+
+    feats["fac_ctx_ridge_tier"] = np.concatenate([oof_ridge, test_ridge])
+    for c in range(4):
+        feats[f"fac_ctx_prob_{c+1}"] = np.concatenate([oof_logit[:, c], test_logit[:, c]])
+
+    print("[5/6] Computing operator-deduplicated spatial KNN (k=10, 35, 80)...")
+    if "geo_lat" in df.columns and "geo_lon" in df.columns:
+        coords = np.column_stack([
+            df["geo_lat"].fillna(df["geo_lat"].median()).to_numpy(dtype=np.float64),
+            df["geo_lon"].fillna(df["geo_lon"].median()).to_numpy(dtype=np.float64),
+        ])
+        if "metro" in df.columns:
+            metro_lat = df.groupby("metro")["geo_lat"].transform("median").fillna(0).to_numpy()
+            metro_lon = df.groupby("metro")["geo_lon"].transform("median").fillna(0).to_numpy()
+            dlat = coords[:, 0] - metro_lat
+            dlon = coords[:, 1] - metro_lon
+            feats["dist_to_metro_center"] = np.sqrt(dlat ** 2 + dlon ** 2).astype(np.float32)
+            feats["angle_to_metro_center"] = np.arctan2(dlat, dlon).astype(np.float32)
+
+        def compute_dedup_knn_block(ref_idx, query_idx, k_list=(10, 35, 80)):
+            ref_df = pd.DataFrame({
+                "op": true_op_codes[ref_idx],
+                "lat": np.round(coords[ref_idx, 0], 5),
+                "lon": np.round(coords[ref_idx, 1], 5),
+                "acc": df["access_type"].iloc[ref_idx].fillna("NA").values if "access_type" in df.columns else "NA",
+                "tier": y_cont[ref_idx],
+                "t1": (y_zero[ref_idx] == 0).astype(np.float32),
+                "t4": (y_zero[ref_idx] == 3).astype(np.float32),
+            })
+            dedup = ref_df.groupby(["op", "lat", "lon", "acc"], as_index=False).agg(
+                {"tier": "mean", "t1": "mean", "t4": "mean"}
+            )
+            tree = cKDTree(np.column_stack([dedup["lat"].to_numpy(), dedup["lon"].to_numpy()]))
+            max_k = min(max(k_list), len(dedup))
+            dists, idxs = tree.query(coords[query_idx], k=max_k)
+            weights = 1.0 / (dists + 1e-4)
+
+            out = {}
+            for k in k_list:
+                kk = min(k, max_k)
+                w = weights[:, :kk]
+                w_sum = w.sum(axis=1, keepdims=True)
+                t_vals = dedup["tier"].to_numpy()[idxs[:, :kk]]
+                out[f"knn_dedup_tier_{k}"] = (np.sum(w * t_vals, axis=1) / w_sum[:, 0]).astype(np.float32)
+                out[f"knn_dedup_std_{k}"] = np.std(t_vals, axis=1).astype(np.float32)
+                if k == 35:
+                    out["knn_dedup_p1_35"] = (np.sum(w * dedup["t1"].to_numpy()[idxs[:, :kk]], axis=1) / w_sum[:, 0]).astype(np.float32)
+                    out["knn_dedup_p4_35"] = (np.sum(w * dedup["t4"].to_numpy()[idxs[:, :kk]], axis=1) / w_sum[:, 0]).astype(np.float32)
+                    out["knn_dedup_dist_10"] = dists[:, min(9, kk - 1)].astype(np.float32)
+            return out
+
+        knn_cols = ["knn_dedup_tier_10", "knn_dedup_std_10", "knn_dedup_tier_35", "knn_dedup_std_35",
+                    "knn_dedup_p1_35", "knn_dedup_p4_35", "knn_dedup_dist_10", "knn_dedup_tier_80", "knn_dedup_std_80"]
+        for c in knn_cols:
+            feats[c] = np.nan
+
+        for fold in range(5):
+            trn_i = np.where(folds != fold)[0]
+            val_i = np.where(folds == fold)[0]
+            res_val = compute_dedup_knn_block(trn_i, val_i)
+            for k_name, arr in res_val.items():
+                feats.loc[val_i, k_name] = arr
+
+        res_test = compute_dedup_knn_block(np.arange(n_train), np.arange(n_train, len(df)))
+        for k_name, arr in res_test.items():
+            feats.loc[n_train:, k_name] = arr
+
+    print("[6/6] Computing leak-free OOF location target encodings and within-operator portfolio stats...")
+    cat_cols = [c for c in df.select_dtypes(include=["object", "category"]).columns if c not in ["facilities", "operator_ref"]]
+    if cat_cols:
+        oe = OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1)
+        feats[[f"cat_{c}" for c in cat_cols]] = oe.fit_transform(df[cat_cols].fillna("MISSING").astype(str)).astype(np.float32)
+
+    te_groups = [
+        ("zone_acc", [c for c in ["zone", "access_type"] if c in df.columns]),
+        ("dist_acc", [c for c in ["district", "access_type"] if c in df.columns]),
+        ("metro_sc_acc", [c for c in ["metro", "space_class", "access_type"] if c in df.columns]),
+    ]
+    global_mean = float(y_cont.mean())
+    for name, cols in te_groups:
+        if not cols:
+            continue
+        key = df[cols].fillna("NA").astype(str).agg("|".join, axis=1)
+        oof_te = np.full(n_train, global_mean, dtype=np.float32)
+        for fold in range(5):
+            trn_i = np.where(folds != fold)[0]
+            val_i = np.where(folds == fold)[0]
+            stats = pd.DataFrame({"k": key.iloc[trn_i], "y": y_cont[trn_i]}).groupby("k")["y"].agg(["count", "mean"])
+            smooth = (stats["count"] * stats["mean"] + 15.0 * global_mean) / (stats["count"] + 15.0)
+            oof_te[val_i] = key.iloc[val_i].map(smooth).fillna(global_mean).to_numpy(dtype=np.float32)
+        stats_full = pd.DataFrame({"k": key.iloc[:n_train], "y": y_cont}).groupby("k")["y"].agg(["count", "mean"])
+        smooth_full = (stats_full["count"] * stats_full["mean"] + 15.0 * global_mean) / (stats_full["count"] + 15.0)
+        test_te = key.iloc[n_train:].map(smooth_full).fillna(global_mean).to_numpy(dtype=np.float32)
+        feats[f"{name}_te_mean"] = np.concatenate([oof_te, test_te])
+
+    feats["true_op_listing_count"] = df.groupby("true_op_id")["space_id"].transform("count").astype(np.float32)
+    feats["physical_listing_snapshots"] = df.groupby("listing_id")["space_id"].transform("count").astype(np.float32)
+
+    op_agg_candidates = [
+        c for c in [
+            "seat_capacity", "desk_count", "room_count", "setup_count",
+            "facility_count", "knn_dedup_tier_35", "zone_acc_te_mean", "fac_ctx_ridge_tier"
+        ] if c in feats.columns
+    ]
+    temp_op = feats[op_agg_candidates].copy()
+    temp_op["true_op_id"] = df["true_op_id"]
+    for c in op_agg_candidates:
+        op_mean = temp_op.groupby("true_op_id")[c].transform("mean").astype(np.float32)
+        feats[f"op_mean_{c}"] = op_mean
+        feats[f"diff_from_op_{c}"] = feats[c] - op_mean
+
+    if "knn_dedup_tier_35" in feats.columns and "fac_ctx_ridge_tier" in feats.columns:
+        feats["spatial_minus_facility_tier"] = feats["knn_dedup_tier_35"] - feats["fac_ctx_ridge_tier"]
+
+    train_v2 = feats.iloc[:n_train].copy()
+    train_v2["price_tier"] = train_raw["price_tier"].to_numpy(dtype=np.int64)
+    test_v2 = feats.iloc[n_train:].copy().reset_index(drop=True)
+
+    meta_groups = {
+        "folds": folds,
+        "train_true_op": df["true_op_id"].iloc[:n_train].to_numpy(),
+        "test_true_op": df["true_op_id"].iloc[n_train:].to_numpy(),
+        "train_listing_id": df["listing_id"].iloc[:n_train].to_numpy(),
+        "test_listing_id": df["listing_id"].iloc[n_train:].to_numpy(),
+        "train_access_type": df["access_type"].iloc[:n_train].fillna("NA").astype(str).to_numpy() if "access_type" in df.columns else np.zeros(n_train),
+        "test_access_type": df["access_type"].iloc[n_train:].fillna("NA").astype(str).to_numpy() if "access_type" in df.columns else np.zeros(len(test_v2)),
+    }
+
+    os.makedirs(out_dir, exist_ok=True)
+    train_v2.to_pickle(os.path.join(out_dir, "train_v2.pkl"))
+    test_v2.to_pickle(os.path.join(out_dir, "test_v2.pkl"))
+    pd.to_pickle(meta_groups, os.path.join(out_dir, "meta_groups.pkl"))
+    print(f"Feature engineering complete in {time.time() - t0:.1f}s! Shape: {train_v2.shape}")
+    return train_v2, test_v2, meta_groups
+
+def reg_to_probs(pred_continuous, sigma=0.62):
+    classes = np.array([0.0, 1.0, 2.0, 3.0])[None, :]
+    logits = -((pred_continuous[:, None] - classes) ** 2) / (2.0 * (sigma ** 2))
+    logits -= logits.max(axis=1, keepdims=True)
+    probs = np.exp(logits)
+    return probs / probs.sum(axis=1, keepdims=True)
+
+def apply_group_consensus(probs, listing_ids, true_ops, access_types):
+    df_p = pd.DataFrame(probs, columns=["p0", "p1", "p2", "p3"])
+    df_p["listing_id"] = listing_ids
+    df_p["true_op"] = true_ops
+    df_p["op_acc"] = pd.Series(true_ops).astype(str) + "_" + pd.Series(access_types).astype(str)
+
+    p_cols = ["p0", "p1", "p2", "p3"]
+    listing_mean = df_p.groupby("listing_id")[p_cols].transform("mean").to_numpy()
+    op_acc_mean = df_p.groupby("op_acc")[p_cols].transform("mean").to_numpy()
+    op_mean = df_p.groupby("true_op")[p_cols].transform("mean").to_numpy()
+
+    smoothed = (
+        0.55 * probs
+        + 0.25 * listing_mean
+        + 0.12 * op_acc_mean
+        + 0.08 * op_mean
+    )
+    return smoothed / smoothed.sum(axis=1, keepdims=True)
+
+def tune_macro_f1_multipliers(probs, y_true, l2_reg=0.015):
+    def loss_func(weights):
+        w = np.array([1.0, weights[0], weights[1], weights[2]])
+        preds = np.argmax(probs * w[None, :], axis=1)
+        f1 = f1_score(y_true, preds, average="macro")
+        penalty = l2_reg * np.sum((w - 1.0) ** 2)
+        return -(f1 - penalty)
+
+    best_w = np.ones(4)
+    best_score = f1_score(y_true, np.argmax(probs, axis=1), average="macro")
+
+    for init in [[1.02, 1.12, 0.98], [1.05, 1.18, 0.95], [1.00, 1.08, 1.00]]:
+        res = minimize(loss_func, init, method="Nelder-Mead", options={"maxiter": 400})
+        cand_w = np.array([1.0, res.x[0], res.x[1], res.x[2]])
+        score = f1_score(y_true, np.argmax(probs * cand_w[None, :], axis=1), average="macro")
+        if score > best_score:
+            best_score = score
+            best_w = cand_w
+    return best_w, best_score
+
+def train_and_export(output_dir="."):
+    data_dir, mode = find_data_dir()
+    if mode == "pickles":
+        print(f"Loading precomputed v2 datasets from {data_dir}...")
+        train_df = pd.read_pickle(os.path.join(data_dir, "train_v2.pkl"))
+        test_df = pd.read_pickle(os.path.join(data_dir, "test_v2.pkl"))
+        meta = pd.read_pickle(os.path.join(data_dir, "meta_groups.pkl"))
+    elif mode == "csv":
+        train_df, test_df, meta = build_v2_features_from_csv(data_dir, out_dir=output_dir)
+    else:
+        raise FileNotFoundError(
+            "Could not find train_v2.pkl/test_v2.pkl or train.csv/test.csv. "
+            "Upload them to your Colab working directory or mount Google Drive."
+        )
+
+    target_col = "price_tier"
+    id_col = "space_id"
+    feature_cols = [c for c in train_df.columns if c not in [id_col, target_col]]
+
+    X = train_df[feature_cols].to_numpy(dtype=np.float32)
+    y = train_df[target_col].to_numpy(dtype=np.int64) - 1
+    X_test = test_df[feature_cols].to_numpy(dtype=np.float32)
+    folds = meta["folds"]
+
+    train_acc_type = (
+        meta["train_access_type"] if "train_access_type" in meta
+        else (train_df["access_type"] if "access_type" in train_df.columns else np.zeros(len(train_df)))
+    )
+    test_acc_type = (
+        meta["test_access_type"] if "test_access_type" in meta
+        else (test_df["access_type"] if "access_type" in test_df.columns else np.zeros(len(test_df)))
+    )
+
+    oof_probs = np.zeros((len(train_df), 4), dtype=np.float64)
+    test_probs_folds = np.zeros((len(test_df), 4), dtype=np.float64)
+    saved_models = []
+
+    print(f"\nStarting 5-Fold StratifiedGroupKFold Training on {len(feature_cols)} features (LightGBM enabled: {HAS_LGB})...")
+    for fold in range(5):
+        f_t0 = time.time()
+        trn_idx = np.where(folds != fold)[0]
+        val_idx = np.where(folds == fold)[0]
+
+        clf_hgb = HistGradientBoostingClassifier(
+            loss="log_loss",
+            learning_rate=0.045,
+            max_iter=750,
+            max_leaf_nodes=63,
+            min_samples_leaf=45,
+            l2_regularization=2.5,
+            max_bins=255,
+            early_stopping=True,
+            validation_fraction=0.1,
+            n_iter_no_change=35,
+            random_state=42 + fold,
+        )
+        clf_hgb.fit(X[trn_idx], y[trn_idx])
+        p_hgb_val = clf_hgb.predict_proba(X[val_idx])
+        p_hgb_test = clf_hgb.predict_proba(X_test)
+
+        reg_l2 = HistGradientBoostingRegressor(
+            loss="squared_error",
+            learning_rate=0.045,
+            max_iter=650,
+            max_leaf_nodes=63,
+            min_samples_leaf=50,
+            l2_regularization=3.0,
+            early_stopping=True,
+            validation_fraction=0.1,
+            n_iter_no_change=35,
+            random_state=142 + fold,
+        )
+        reg_l2.fit(X[trn_idx], y[trn_idx].astype(np.float32))
+        p_l2_val = reg_to_probs(reg_l2.predict(X[val_idx]))
+        p_l2_test = reg_to_probs(reg_l2.predict(X_test))
+
+        reg_l1 = HistGradientBoostingRegressor(
+            loss="absolute_error",
+            learning_rate=0.045,
+            max_iter=650,
+            max_leaf_nodes=63,
+            min_samples_leaf=50,
+            l2_regularization=3.0,
+            early_stopping=True,
+            validation_fraction=0.1,
+            n_iter_no_change=35,
+            random_state=242 + fold,
+        )
+        reg_l1.fit(X[trn_idx], y[trn_idx].astype(np.float32))
+        p_l1_val = reg_to_probs(reg_l1.predict(X[val_idx]))
+        p_l1_test = reg_to_probs(reg_l1.predict(X_test))
+
+        p_ord_val = 0.65 * p_l2_val + 0.35 * p_l1_val
+        p_ord_test = 0.65 * p_l2_test + 0.35 * p_l1_test
+
+        fold_bundle = {"fold": fold, "clf_hgb": clf_hgb, "reg_l2": reg_l2, "reg_l1": reg_l1}
+
+        if HAS_LGB:
+            clf_lgb = lgb.LGBMClassifier(
+                objective="multiclass",
+                num_class=4,
+                n_estimators=1200,
+                learning_rate=0.04,
+                num_leaves=63,
+                min_child_samples=45,
+                subsample=0.8,
+                colsample_bytree=0.75,
+                reg_alpha=1.5,
+                reg_lambda=2.5,
+                random_state=342 + fold,
+                n_jobs=-1,
+                verbose=-1,
+            )
+            clf_lgb.fit(
+                X[trn_idx], y[trn_idx],
+                eval_set=[(X[val_idx], y[val_idx])],
+                callbacks=[lgb.early_stopping(40, verbose=False)],
+            )
+            p_lgb_val = clf_lgb.predict_proba(X[val_idx])
+            p_lgb_test = clf_lgb.predict_proba(X_test)
+            fold_val_probs = 0.45 * p_hgb_val + 0.35 * p_lgb_val + 0.20 * p_ord_val
+            fold_test_probs = 0.45 * p_hgb_test + 0.35 * p_lgb_test + 0.20 * p_ord_test
+            fold_bundle["clf_lgb"] = clf_lgb
+        else:
+            fold_val_probs = 0.80 * p_hgb_val + 0.20 * p_ord_val
+            fold_test_probs = 0.80 * p_hgb_test + 0.20 * p_ord_test
+
+        oof_probs[val_idx] = fold_val_probs
+        test_probs_folds += fold_test_probs / 5.0
+        saved_models.append(fold_bundle)
+
+        val_smoothed = apply_group_consensus(
+            fold_val_probs,
+            meta["train_listing_id"][val_idx],
+            meta["train_true_op"][val_idx],
+            np.asarray(train_acc_type)[val_idx],
+        )
+        raw_f1 = f1_score(y[val_idx], np.argmax(val_smoothed, axis=1), average="macro")
+        w_fold, tuned_f1 = tune_macro_f1_multipliers(val_smoothed, y[val_idx])
+        print(
+            f"Fold {fold+1}/5 ({time.time() - f_t0:.1f}s) | "
+            f"Leak-Free OOF Raw F1: {raw_f1:.5f} | Tuned F1: {tuned_f1:.5f} | "
+            f"Mult: {np.round(w_fold, 4)}"
+        )
+
+    oof_smoothed = apply_group_consensus(
+        oof_probs, meta["train_listing_id"], meta["train_true_op"], train_acc_type
+    )
+    test_smoothed = apply_group_consensus(
+        test_probs_folds, meta["test_listing_id"], meta["test_true_op"], test_acc_type
+    )
+
+    multipliers, best_oof_f1 = tune_macro_f1_multipliers(oof_smoothed, y)
+    oof_final_preds = np.argmax(oof_smoothed * multipliers[None, :], axis=1)
+    per_class_f1 = f1_score(y, oof_final_preds, average=None)
+
+    print("\n" + "=" * 70)
+    print(f"FINAL 5-FOLD LEAK-FREE OOF MACRO F1 : {best_oof_f1:.5f}")
+    print(f"Per-Class F1 (Tiers 1..4)           : {np.round(per_class_f1, 4)}")
+    print(f"Optimal Class Multipliers           : {np.round(multipliers, 4)}")
+    print("=" * 70)
+
+    os.makedirs(output_dir, exist_ok=True)
+    final_test_preds = np.argmax(test_smoothed * multipliers[None, :], axis=1) + 1
+    sub_path = os.path.join(output_dir, "submission.csv")
+    sub = pd.DataFrame({"ID": test_df[id_col].astype(int), "price_tier": final_test_preds})
+    sub.to_csv(sub_path, index=False)
+    print(f"Saved Kaggle submission file to: {sub_path} ({len(sub):,} rows)")
+
+    model_path = os.path.join(output_dir, "workstation_price_tier_v2_model.joblib")
+    model_artifact = {
+        "models": saved_models,
+        "multipliers": multipliers,
+        "feature_cols": feature_cols,
+        "oof_macro_f1": best_oof_f1,
+        "per_class_f1": per_class_f1,
+        "has_lgb": HAS_LGB,
+    }
+    joblib.dump(model_artifact, model_path, compress=3)
+    print(f"Saved trained model file to    : {model_path}")
+    return model_artifact, sub
+
+model_artifact, submission_df = train_and_export(output_dir=".")
